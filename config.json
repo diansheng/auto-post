@@ -1,0 +1,12 @@
+{
+    "cookie_path": "cookies.pkl",
+    "image_dir": "images_to_post",
+    "max_retries": 3,
+    "timeout": 30,
+    "upload_timeout": 120,
+    "scroll_pause_time": 1,
+    "wait_after_upload": 3,
+    "wait_after_publish": 5,
+    "headless": false,
+    "default_json": "example_post.json"
+}
