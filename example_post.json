@@ -1,6 +1,6 @@
 {
     "title": "小红书自动发布测试",
-    "description": "这是一个使用自动化工具发布的小红书笔记，通过JSON文件配置内容。\n\n这个工具可以帮助创作者批量发布内容，提高效率。\n\n 如果你觉得不错，请给我一个github项目star支持一下，谢谢！\n\n详细github项目：https://github.com/diansh/rednote_auto_post",
+    "description": "这是一个使用自动化工具发布的小红书笔记，通过JSON文件配置内容。\n\n这个工具可以帮助创作者批量发布内容，提高效率。\n\n 如果你觉得不错，请给我一个github项目star支持一下，谢谢！\n\n详细github项目：https://github.com/diansheng/auto-post",
     "image_dir": "images_to_post",
     "hashtags": ["#自动化工具", "#小红书笔记", "#Python", "#Selenium"]
 }
