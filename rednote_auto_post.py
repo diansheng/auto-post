@@ -169,7 +169,7 @@ def upload_post_content(driver, image_paths, title, description):
         # 点击发布
         publish_btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[text()="发布"]')))
         # 实际发布（如果需要测试不发布，可以注释此行）
-        # publish_btn.click()
+        publish_btn.click()
         time.sleep(5)
         logger.info("已点击发布按钮")
         
