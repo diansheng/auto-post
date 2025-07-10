@@ -8,5 +8,7 @@
     "wait_after_upload": 3,
     "wait_after_publish": 5,
     "headless": false,
-    "default_json": "example_post.json"
+    "debug": false,
+    "log_level": "INFO",
+    "log_file": "rednote_auto_post.log"
 }

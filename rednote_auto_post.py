@@ -7,7 +7,11 @@
 3. pip install selenium
 
 此模块可以被其他组件调用，支持自定义标题、描述、图片和标签
-也可以从JSON文件中读取发布内容
+支持通过Python字典对象配置发布内容
+支持在标题和描述中使用emoji表情符号，具有多层错误处理和备用机制：
+- 主要使用JavaScript执行器设置文本并触发DOM事件
+- 如果主要方法失败，会尝试备用JavaScript方法
+- 如果JavaScript方法都失败，会回退到send_keys方法（自动移除emoji）
 """
 
 import time
@@ -16,6 +20,7 @@ import sys
 import datetime
 import traceback
 import json
+import re
 from typing import List, Dict, Optional, Union, Any
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -27,13 +32,15 @@ import pickle
 
 # 导入日志配置
 from logging_config import logger
+from example_post import post_data
 
 # === 默认配置参数 ===
 DEFAULT_CONFIG = {
     'cookie_path': 'cookies.pkl',  # 登录后的 Cookie 文件路径
     'image_dir': 'images_to_post',  # 图片文件夹
     'max_retries': 1,  # 最大重试次数
-    'default_json': 'example_post.json'  # 默认JSON配置文件路径
+    'default_content': post_data,
+    'debug': False  # 调试模式
 }
 
 # === 初始化浏览器 ===
@@ -50,6 +57,140 @@ def init_browser():
     driver = webdriver.Chrome(service=Service(), options=options)
     logger.debug("浏览器初始化完成")
     return driver
+
+# === 安全地设置输入框的值 ===
+def safe_set_input_value(driver, element, value, field_name="输入框"):
+    """安全地设置输入框的值，包含多层错误处理和备用方案
+    
+    此函数提供了一个健壮的方式来设置输入字段的值，特别是当值包含emoji等特殊字符时。
+    它使用三层策略来确保文本能够被正确输入：
+    1. 首先尝试使用JavaScript执行器设置值并触发标准DOM事件
+    2. 如果第一种方法失败，尝试使用InputEvent替代Event对象
+    3. 如果JavaScript方法都失败，回退到send_keys方法（自动移除emoji）
+    
+    每一步都有验证和详细的日志记录，以便于调试问题。
+    
+    此函数支持两种类型的输入元素：
+    - 标准表单元素（如input、textarea）：使用value属性设置值
+    - contentEditable元素（如div）：使用textContent属性设置值
+    
+    Args:
+        driver: Selenium WebDriver实例
+        element: 输入元素（WebElement对象）
+        value: 要设置的值（可以包含emoji等特殊字符）
+        field_name: 字段名称，用于日志记录，默认为"输入框"
+        
+    Returns:
+        bool: 是否成功设置值（True表示成功，False表示所有方法都失败）
+    
+    Example:
+        ```python
+        # 设置标题（包含emoji）
+        title_input = driver.find_element(By.XPATH, '//input[@placeholder="标题"]')
+        safe_set_input_value(driver, title_input, "✨ 测试标题 🚀", "标题")
+        ```
+    """
+    # 主要方法：使用JavaScript执行器处理包含emoji的文本并触发必要的事件
+    # 注意：如果需要保留HTML格式（如粗体、链接等），请取消注释innerHTML行并注释textContent行
+    # 例如：当处理富文本编辑器且需要保留格式化内容时，应使用innerHTML
+    js_set_value_with_events = """
+    // 检测元素类型并使用适当的属性设置值
+    if (arguments[0].tagName === 'DIV' || arguments[0].getAttribute('contenteditable') === 'true') {
+        // 对于contentEditable元素，使用textContent或innerHTML
+        // 注意：
+        // - textContent适用于纯文本内容，会移除所有HTML标签
+        // - innerHTML适用于需要保留HTML格式的情况（如粗体、链接等）
+        // 默认使用textContent，因为它更安全（防止XSS）且适合大多数情况
+        // 如果输入内容包含HTML标记且需要保留格式，请修改此处使用innerHTML
+        arguments[0].textContent = arguments[1];
+        // arguments[0].innerHTML = arguments[1];
+    } else {
+        // 对于标准表单元素，使用value属性
+        arguments[0].value = arguments[1];
+    }
+    arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+    arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+    return true; // 返回值以确认执行成功
+    """
+    
+    try:
+        result = driver.execute_script(js_set_value_with_events, element, value)
+        if result:
+            logger.debug(f"已成功输入{field_name}: {value}")
+            # 验证文本是否已输入 - 根据元素类型检查不同属性
+            js_verify = """
+            if (arguments[0].tagName === 'DIV' || arguments[0].getAttribute('contenteditable') === 'true') {
+                return arguments[0].textContent || arguments[0].innerHTML;
+            } else {
+                return arguments[0].value;
+            }
+            """
+            actual_value = driver.execute_script(js_verify, element)
+            if actual_value:
+                return True
+            else:
+                logger.warning(f"{field_name}可能未成功输入，尝试备用方法")
+        else:
+            logger.warning(f"JavaScript执行器未返回成功状态（{field_name}）")
+        
+        # 备用方法1：尝试使用InputEvent
+        logger.debug(f"尝试使用备用方法输入{field_name}")
+        # 先清空输入框 - 根据元素类型使用不同的清空方法
+        js_clear = """
+        if (arguments[0].tagName === 'DIV' || arguments[0].getAttribute('contenteditable') === 'true') {
+            arguments[0].textContent = '';
+        } else {
+            arguments[0].value = '';
+        }
+        return true;
+        """
+        driver.execute_script(js_clear, element)
+        # 使用更直接的DOM操作方法
+        # 对于contentEditable元素使用textContent，对于标准表单元素使用value
+        js_alternative = """
+        if (arguments[0].tagName === 'DIV' || arguments[0].getAttribute('contenteditable') === 'true') {
+            arguments[0].textContent = arguments[1];
+        } else {
+            arguments[0].value = arguments[1];
+        }
+        arguments[0].dispatchEvent(new InputEvent('input', {bubbles: true, cancelable: true, composed: true}));
+        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+        """
+        driver.execute_script(js_alternative, element, value)
+        
+        # 再次验证 - 使用相同的验证逻辑
+        actual_value = driver.execute_script(js_verify, element)
+        if actual_value:
+            logger.debug(f"已使用备用方法成功输入{field_name}")
+            return True
+        else:
+            logger.warning(f"备用方法1也未能成功输入{field_name}")
+    except Exception as e:
+        logger.error(f"输入{field_name}时发生错误: {str(e)}")
+    
+    # 备用方法2：使用send_keys方法作为最后的备用
+    # 注意：send_keys方法会自动移除emoji等非BMP字符
+    # 这是最后的备用方法，只有在JavaScript方法都失败时才会使用
+    try:
+        # 检查元素类型，对contentEditable元素使用JavaScript清空内容
+        # 这是必要的，因为element.clear()方法对contentEditable元素无效
+        if driver.execute_script("return arguments[0].tagName === 'DIV' || arguments[0].getAttribute('contenteditable') === 'true'", element):
+            # 对于contentEditable元素，使用JavaScript清空内容
+            driver.execute_script("arguments[0].textContent = '';", element)
+        else:
+            # 对于标准表单元素，使用clear方法
+            element.clear()
+            
+        # 移除非BMP字符以避免ChromeDriver错误
+        # send_keys方法不能处理emoji等非BMP字符，所以需要移除它们
+        safe_value = process_emoji_text(value, mode='remove')
+        element.send_keys(safe_value)
+        logger.debug(f"已使用send_keys方法输入{field_name}（已移除emoji）: {safe_value}")
+        return True
+    except Exception as inner_e:
+        logger.error(f"所有输入{field_name}的方法都失败: {str(inner_e)}")
+        return False
 
 # === 加载 cookies ===
 def load_cookies(driver, cookie_path: str) -> None:
@@ -84,102 +225,7 @@ def check_image_directory_and_get_paths(image_dir: str) -> Optional[List[str]]:
     logger.info(f"找到 {len(image_files)} 张图片")
     return [os.path.abspath(os.path.join(image_dir, fname)) for fname in image_files]
 
-# === 验证图片路径 ===
-def validate_image_paths(image_paths: List[str]) -> bool:
-    """验证图片路径列表是否有效
-    
-    Args:
-        image_paths: 图片路径列表
-        
-    Returns:
-        bool: 所有路径是否有效
-    
-    Note:
-        此函数假设image_paths不为空，因为在publish_post函数中已经处理了空列表的情况
-    """
-    # 不再检查空列表，因为在调用此函数前已经处理了空列表的情况
-    # 并且确保了传入的列表不为空
-    
-    # 获取所有图片所在的目录
-    image_dirs = set()
-    for path in image_paths:
-        image_dir = os.path.dirname(path)
-        if image_dir:
-            image_dirs.add(image_dir)
-        else:
-            # 如果路径没有目录部分，使用当前目录
-            image_dirs.add('.')
-    
-    # 检查目录是否存在
-    valid = True
-    for dir_path in image_dirs:
-        if not os.path.exists(dir_path):
-            logger.warning(f"图片目录不存在: {dir_path}")
-            logger.info(f"请创建此目录或修改图片路径")
-            valid = False
-        elif not os.listdir(dir_path):
-            logger.warning(f"图片目录为空: {dir_path}")
-            logger.info(f"请在此目录中添加图片")
-            # 目录为空不影响验证结果，只是警告
-    
-    # 检查文件扩展名
-    for path in image_paths:
-        if not path.lower().endswith(('.png', '.jpg', '.jpeg', '.svg')):
-            logger.warning(f"文件可能不是图片: {path}")
-    
-    logger.info(f"验证了 {len(image_paths)} 个图片路径")
-    return valid
-
-# === 上传图片并发布 ===
-def upload_post_content(driver, image_paths, title, description):
-    """上传图片并发布笔记"""
-    logger.info("开始上传图片并发布笔记")
-    wait = WebDriverWait(driver, 15)
-    
-    try:
-        # 上传图片
-        upload_input = wait.until(EC.presence_of_element_located((By.XPATH, '//input[@type="file"]')))
-        
-        # 确保上传元素可见
-        driver.execute_script(
-            "arguments[0].style.display = 'block'; arguments[0].style.visibility = 'visible';", 
-            upload_input
-        )
-        
-        # 上传所有图片
-        upload_input.send_keys("\n".join(image_paths))
-        logger.info(f"正在上传 {len(image_paths)} 张图片")
-        
-        # 等待图片加载完成
-        time.sleep(3)
-        logger.debug("等待图片加载完成")
-        
-        # 输入标题
-        title_input = wait.until(EC.presence_of_element_located((By.XPATH, '//*[@placeholder="填写标题会有更多赞哦～"]')))
-        title_input.send_keys(title)
-        logger.debug(f"已输入标题: {title}")
-        time.sleep(3)
-        
-        # 输入正文
-        desc_input = wait.until(EC.presence_of_element_located((By.XPATH, '//*[@data-placeholder="输入正文描述，真诚有价值的分享予人温暖"]')))
-        desc_input.send_keys(description)
-        logger.debug("已输入正文")
-        time.sleep(15)
-        
-        # 点击发布
-        publish_btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[text()="发布"]')))
-        # 实际发布（如果需要测试不发布，可以注释此行）
-        publish_btn.click()
-        time.sleep(5)
-        logger.info("已点击发布按钮")
-        
-        return True
-    except Exception as e:
-        logger.error(f"上传图片或发布失败: {str(e)}")
-        screenshot_path = "publish_failed.png"
-        driver.save_screenshot(screenshot_path)
-        logger.debug(f"已保存失败截图: {screenshot_path}")
-        return False
+# 移除未使用的validate_image_paths函数，其功能已在check_image_directory_and_get_paths中实现
 
 # === 自动化发布流程 ===
 def _publish_post(driver, image_paths: List[str], title: str, 
@@ -197,141 +243,209 @@ def _publish_post(driver, image_paths: List[str], title: str,
         
     Returns:
         bool: 发布是否成功
-        
-    Note:
-        此函数假设所有必要参数已经过验证，不应传入None值
     """    
     logger.info("开始发布笔记流程")
     wait = WebDriverWait(driver, 15)
+    hashtags = hashtags or []
 
     # 尝试直接访问创建页面
-    creation_urls = [
-        "https://creator.xiaohongshu.com/publish/publish?from=menu&target=post", # 创建图文
-        # "https://creator.xiaohongshu.com/publish/publish?from=menu&target=video", # 创建video
-        # "https://creator.xiaohongshu.com/publish"
-    ]
-
-    # 尝试访问创建页面URL
-    for url in creation_urls:
+    creation_url = "https://creator.xiaohongshu.com/publish/publish?from=menu&target=post"
+    try:
+        logger.info(f"尝试访问创建页面: {creation_url}")
+        driver.get(creation_url)
+        time.sleep(5)
+        
+        # 上传图片
         try:
-            logger.info(f"尝试访问创建页面: {url}")
-            driver.get(url)
-            time.sleep(5)
+            upload_input = wait.until(EC.presence_of_element_located((By.XPATH, '//input[@type="file"]')))
             
-            try:
-                file_input = driver.find_element(By.XPATH, '//input[@type="file"]')
-                logger.info(f"成功进入创建页面: {url}")
-                break
-            except:
-                logger.error(f"在 {url} 未找到上传元素")
+            # 确保上传元素可见
+            driver.execute_script(
+                "arguments[0].style.display = 'block'; arguments[0].style.visibility = 'visible';", 
+                upload_input
+            )
+            
+            # 上传所有图片
+            upload_input.send_keys("\n".join(image_paths))
+            logger.info(f"正在上传 {len(image_paths)} 张图片")
+            
+            # 等待图片加载完成
+            time.sleep(3)
+            
+            # 输入标题
+            title_input = wait.until(EC.presence_of_element_located((By.XPATH, '//*[@placeholder="填写标题会有更多赞哦～"]')))
+            # 使用安全的输入方法设置标题
+            safe_set_input_value(driver, title_input, title, field_name="标题")
+            time.sleep(3)
+            
+            # 将标签添加到描述中
+            full_description = f"{description}\n{' '.join(hashtags)}"
+            
+            # 输入正文
+            desc_input = wait.until(EC.presence_of_element_located((By.XPATH, '//*[@data-placeholder="输入正文描述，真诚有价值的分享予人温暖"]')))
+            # 使用安全的输入方法设置正文
+            safe_set_input_value(driver, desc_input, full_description, field_name="正文")
+            time.sleep(15)
+            
+            # 点击发布
+            publish_btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[text()="发布"]')))
+            if config['debug']:
+                publish_btn.click()
+            time.sleep(5)
+            logger.info("已点击发布按钮")
+            logger.info("流程执行完成")
+            
+            return True
         except Exception as e:
-            logger.error(f"访问 {url} 出错: {str(e)}")
-    else:  # 如果所有URL都失败
-        # 保存截图帮助调试
+            logger.error(f"上传图片或发布失败: {str(e)}")
+            screenshot_path = "publish_failed.png"
+            driver.save_screenshot(screenshot_path)
+            logger.debug(f"已保存失败截图: {screenshot_path}")
+            return False
+    except Exception as e:
+        logger.error(f"访问创建页面出错: {str(e)}")
         screenshot_path = "debug_screenshot.png"
         driver.save_screenshot(screenshot_path)
         logger.error("无法进入创建页面，请检查网站结构是否变化")
         return False
-    
-    # 将标签添加到描述中
-    full_description = f"{description}\n{' '.join(hashtags)}"
-    
-    # 调用上传图片并发布函数
-    result = upload_post_content(driver, image_paths, title, full_description)
-    
-    if result:
-        logger.info("流程执行完成")
-    
-    return result
 
-# === 从JSON文件读取发布内容 ===
-def load_post_from_json(json_file_path: str) -> Dict[str, Any]:
-    """从JSON文件中读取发布内容
-    
-    JSON文件格式示例:
-    {
-        "title": "笔记标题",
-        "description": "笔记描述内容",
-        "image_dir": "path_to_image",
-        "hashtags": ["#标签1", "#标签2"]
-    }
+# === 处理Emoji和验证Python字典对象 ===
+
+def process_emoji_text(text: str, mode: str = 'keep') -> str:
+    """处理包含emoji的文本
     
     Args:
-        json_file_path: JSON文件路径
+        text: 包含emoji的文本
+        mode: 处理模式，可选值：
+            - 'keep': 保留emoji（默认，用于JavaScript执行器）
+            - 'remove': 移除所有非BMP字符（用于ChromeDriver直接输入）
+            - 'replace': 将emoji替换为其描述（例如：😊 -> [笑脸]）
+    
+    Returns:
+        str: 处理后的文本
+    """
+    if not text:
+        return ""
+        
+    if mode == 'keep':
+        return text
+    elif mode == 'remove':
+        return ''.join(c for c in text if ord(c) < 0x10000)
+    elif mode == 'replace':
+        # 简单替换常见emoji，可根据需要扩展
+        emoji_map = {
+            '😊': '[笑脸]',
+            '😂': '[笑哭]',
+            '❤️': '[爱心]',
+            '👍': '[赞]',
+            '🎉': '[庆祝]',
+            '🔥': '[火]',
+            '✨': '[闪光]',
+            '🚀': '[火箭]',
+            # 可以根据需要添加更多映射
+        }
+        
+        for emoji, replacement in emoji_map.items():
+            text = text.replace(emoji, replacement)
+            
+        # 对于未定义的emoji，使用通用替换
+        # 匹配大多数emoji的正则表达式
+        emoji_pattern = re.compile(
+            "["  
+            "\U0001F600-\U0001F64F"  # 表情符号
+            "\U0001F300-\U0001F5FF"  # 符号和象形文字
+            "\U0001F680-\U0001F6FF"  # 交通和地图
+            "\U0001F700-\U0001F77F"  # 警告符号
+            "\U0001F780-\U0001F7FF"  # 几何图形
+            "\U0001F800-\U0001F8FF"  # 补充箭头
+            "\U0001F900-\U0001F9FF"  # 补充符号和象形文字
+            "\U0001FA00-\U0001FA6F"  # 棋子符号
+            "\U0001FA70-\U0001FAFF"  # 符号和象形文字扩展
+            "\U00002702-\U000027B0"  # 装饰符号
+            "\U000024C2-\U0000257F"  # 封闭字母数字
+            "\U00002600-\U000026FF"  # 杂项符号
+            "\U00002700-\U000027BF"  # 装饰符号
+            "\U0000FE00-\U0000FE0F"  # 变体选择器
+            "\U0001F900-\U0001F9FF"  # 补充符号和象形文字
+            "\U00002B50"             # 星形
+            "\U00002B55"             # 圆形
+            "\U00002B1B-\U00002B1C"  # 黑白方块
+            "\U0000200D"             # 零宽连接符
+            "\U00002640-\U00002642"  # 性别符号
+            "\U00002600-\U00002B55"  # 杂项符号和箭头
+            "]", 
+            flags=re.UNICODE
+        )
+        
+        return emoji_pattern.sub(r'[emoji]', text)
+    else:
+        raise ValueError(f"不支持的处理模式: {mode}")
+
+def validate_post_data(data: Dict[str, Any]) -> bool:
+    """验证发布内容数据是否有效
+    
+    Args:
+        data: 包含发布内容的字典
         
     Returns:
-        包含发布内容的字典
+        bool: 数据是否有效
     """
-    try:
-        with open(json_file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # 验证必要字段
-        required_fields = ['title', 'description']
-        for field in required_fields:
-            if field not in data:
-                logger.error(f"JSON文件缺少必要字段: {field}")
-                return {}
-        
-        logger.info(f"成功从 {json_file_path} 加载发布内容")
-        return data
-    
-    except Exception as e:
-        logger.error(f"读取JSON文件失败: {str(e)}")
-        return {}
+    # 验证必要字段
+    required_fields = ['title', 'description']
+    for field in required_fields:
+        if field not in data:
+            logger.error(f"发布数据缺少必要字段: {field}")
+            return False
+    return True
 
 # === 主函数 ===
 def publish_post(title: Optional[str] = None, description: Optional[str] = None,  
                 image_dir: Optional[str] = None, hashtags: Optional[List[str]] = None,
-             json_file: Optional[str] = None, config: Optional[Dict[str, Any]] = None) -> bool:
-    """发布小红书笔记的主函数。负责验证参数，加载JSON内容，处理图片路径，调用发布流程。
-    1. 验证参数：检查标题、描述、图片路径、标签是否为空，以及JSON文件路径是否存在。
-    2. 加载JSON内容：如果提供了JSON文件路径，就读取其中的内容。
-    3. 处理图片路径：根据提供的图片路径或JSON文件中的路径，获取实际的图片文件路径。
-    4. 调用发布流程：使用处理后的参数（标题、描述、图片路径、标签）调用发布函数。
+                post_data: Optional[Dict[str, Any]] = None,
+                config: Optional[Dict[str, Any]] = None) -> bool:
+    """发布小红书笔记的主函数
     
     Args:
-        title: 笔记标题，如果为None则尝试从JSON文件获取，若仍为None则生成测试标题
-        description: 笔记描述，如果为None则尝试从JSON文件获取，若仍为None则生成测试描述
-        image_dir: 
-        hashtags: 标签列表，如果为None则尝试从JSON文件获取，若仍为None则使用空列表
-        json_file: JSON文件路径，如果提供则从中读取内容，但传入的参数优先级更高
-        config: 配置字典，包含cookie_path, image_dir等参数，如果为None则使用默认配置
+        title: 笔记标题，如果为None则尝试从post_data获取，若仍为None则生成测试标题
+        description: 笔记描述，如果为None则尝试从post_data获取，若仍为None则生成测试描述
+        image_dir: 图片目录路径
+        hashtags: 标签列表
+        post_data: Python字典对象，包含发布内容
+        config: 配置字典
         
     Returns:
         bool: 发布是否成功
-        
-    Note:
-        - 参数优先级：直接传入的参数 > JSON文件中的值 > 默认生成的值
-        - 图片路径会进行验证，确保所有图片都存在且为有效文件
-        - 空的图片路径列表[]会触发从默认目录获取图片的逻辑
     """
+    # 初始化配置
+    tmp_conf = DEFAULT_CONFIG.copy()
+    tmp_conf.update(config or {})
+    config = tmp_conf
+    post_data = post_data or config.get('default_content')
+    image_dir = image_dir or config.get('image_dir')
+    max_retries = config.get('max_retries', 1)
     
-    # 使用默认配置或传入的配置
-    config = config or DEFAULT_CONFIG.copy()
-
-    json_file = json_file or config['default_json']
-    if not os.path.exists(json_file):
-        logger.error(f"配置文件{json_file}不存在")
+    # 从Python字典对象加载数据
+    if post_data and validate_post_data(post_data):
+        logger.info("使用Python字典对象作为发布内容")
+        title = title or post_data.get('title')    
+        description = description or post_data.get('description')
+        image_dir = image_dir or post_data.get('image_dir')
+        hashtags = hashtags or post_data.get('hashtags',[])
+    elif not title or not description:
+        logger.error("发布内容无效：未提供有效的post_data或直接参数")
         return False
-
-    # 优先使用传入的参数，只有当参数为None时才使用JSON文件中的值
-    json_data = load_post_from_json(json_file)
-    if json_data:
-        title = title or json_data.get('title')    
-        description = description or json_data.get('description')
-        image_dir = image_dir or json_data.get('image_dir')
-        hashtags = hashtags or json_data.get('hashtags',[])
-    else:
-        logger.error(f"配置文件{json_file}有损坏。退出")
+        
+    # 获取图片路径
+    if not image_dir:
+        logger.error("未指定图片目录")
         return False
-
-    # 解析出image_dir下的图片文件
+        
     image_paths = check_image_directory_and_get_paths(image_dir)
-    logger.info(f"从{image_dir}获取图片路径: {len(image_paths)}张图片")
-
-    # validate variables
-    # 如果没有提供标题和描述，生成测试值
+    if not image_paths:
+        logger.error(f"图片路径{image_dir}下无图片，无法发布笔记")
+        return False
+    
+    # 设置默认值
     if title is None:
         title = "测试笔记" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         logger.info(f"未提供标题，使用自动生成的标题: {title}")
@@ -340,18 +454,8 @@ def publish_post(title: Optional[str] = None, description: Optional[str] = None,
         description = "这是一个自动发布的测试笔记，发布时间：" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"未提供描述，使用自动生成的描述")
     
-    if hashtags is None:
-        hashtags = []    
-        
-    if len(image_paths)==0:
-        logger.error(f"图片路径{image_dir}下无图片，无法发布笔记")
-        logger.info(f"请在 {image_dir} 目录中添加图片后再运行脚本")
-        return False
-    
-    max_retries = config.get('max_retries', 3)
-    retry_count = 0
-    
-    while retry_count < max_retries:
+    # 执行发布流程，支持重试
+    for retry_count in range(max_retries):
         driver = None
         try:
             # 初始化浏览器
@@ -370,89 +474,85 @@ def publish_post(title: Optional[str] = None, description: Optional[str] = None,
                 load_cookies(driver, cookie_path)
             
             # 发布笔记
-            success = _publish_post(driver, image_paths, title, description, hashtags, config)
-            
-            # 关闭浏览器
-            driver.quit()
-            
-            if success:
+            if _publish_post(driver, image_paths, title, description, hashtags, config):
                 logger.info("任务完成")
-                return True  # 成功完成，返回True
-            else:
-                retry_count += 1
-                logger.warning(f"发布失败 (尝试 {retry_count}/{max_retries})")
+                driver.quit()
+                return True
+                
+            logger.warning(f"发布失败 (尝试 {retry_count + 1}/{max_retries})")
             
         except Exception as e:
-            retry_count += 1
-            logger.error(f"发生错误 (尝试 {retry_count}/{max_retries}): {str(e)}")
+            logger.error(f"发生错误 (尝试 {retry_count + 1}/{max_retries}): {str(e)}")
             logger.debug(traceback.format_exc())
             
             # 保存错误截图
             if driver:
                 try:
-                    screenshot_path = f"error_{retry_count}.png"
-                    driver.save_screenshot(screenshot_path)
-                    logger.debug(f"已保存错误截图: {screenshot_path}")
+                    driver.save_screenshot(f"error_{retry_count + 1}.png")
                     driver.quit()
                 except:
                     pass
-            
-            if retry_count < max_retries:
-                logger.info(f"将在 10 秒后重试...")
-                time.sleep(10)
-            else:
-                logger.error(f"已达到最大重试次数 ({max_retries})，放弃任务")
-                return False
-
-# === 命令行入口 ===
-def parse_args():
-    """解析命令行参数"""
-    import argparse
+        
+        # 如果不是最后一次尝试，等待后重试
+        if retry_count < max_retries - 1:
+            logger.info(f"将在 10 秒后重试...")
+            time.sleep(10)
     
-    parser = argparse.ArgumentParser(description='小红书自动发布工具')
-    parser.add_argument('--content-json', type=str, help='content json, same format as example.json')
-    parser.add_argument('--title', type=str, help='笔记标题')
-    parser.add_argument('--description', type=str, help='笔记描述')
-    parser.add_argument('--image-dir', type=str, help='图片目录')
-    parser.add_argument('--hashtags', type=str, nargs='+', help='标签列表')
-    parser.add_argument('--cookie-path', type=str, help='Cookie文件路径')
-    
-    return parser.parse_args()
+    logger.error(f"已达到最大重试次数 ({max_retries})，放弃任务")
+    return False
 
+# === 命令行入口和配置加载 ===
 def load_config(config_path='config.json'):
     """加载配置文件"""
     config = dict()
     if config_path and os.path.exists(config_path):
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
-                user_config = json.load(f)
-            config.update(user_config)
+                config.update(json.load(f))
             logger.info(f"已加载配置文件: {config_path}")
         except Exception as e:
             logger.error(f"加载配置文件失败: {str(e)}")
     return config
 
-def main():
-    """命令行入口函数"""
-
+# 导出的函数和变量
+__all__ = [
+    'publish_post',
+    'validate_post_data',
+    'check_image_directory_and_get_paths',
+    'process_emoji_text',
+    'safe_set_input_value'
+]
 
 # === 主流程 ===
 if __name__ == '__main__':
     logger.info("=== 小红书自动发布工具启动 ===")
     try:
         # 解析命令行参数
-        args = parse_args()
-        # 加载配置
+        import argparse
+        parser = argparse.ArgumentParser(description='小红书自动发布工具')
+        parser.add_argument('--title', type=str, help='笔记标题')
+        parser.add_argument('--description', type=str, help='笔记描述')
+        parser.add_argument('--image-dir', type=str, help='图片目录')
+        parser.add_argument('--hashtags', type=str, nargs='+', help='标签列表')
+        parser.add_argument('--cookie-path', type=str, help='Cookie文件路径')
+        args = parser.parse_args()
+        
+        # 加载配置并发布
         config = load_config()
-        publish_post(
+        if args.cookie_path:
+            config['cookie_path'] = args.cookie_path
+            
+        result = publish_post(
             title=args.title,
             description=args.description,
             image_dir=args.image_dir,
             hashtags=args.hashtags,
-            json_file=args.content_json,
             config=config
         )
-        logger.info("=== 小红书自动发布工具正常退出 ===")
+        
+        exit_code = 0 if result else 1
+        logger.info(f"=== 小红书自动发布工具{'正常' if result else '异常'}退出 ===")
+        sys.exit(exit_code)
     except Exception as e:
         logger.error(f"程序执行过程中发生错误: {str(e)}")
         logger.debug(traceback.format_exc())
